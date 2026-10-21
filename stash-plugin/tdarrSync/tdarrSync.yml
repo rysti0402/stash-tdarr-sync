@@ -1,0 +1,84 @@
+name: Tdarr Sync
+description: >-
+  Repairs the Stash database after Tdarr transcodes a file. Rescans the new file and
+  folds it back onto the original scene so tags, performers, studio, markers, o-counter,
+  play history and stash-ids all survive the transcode.
+version: 0.1.0
+url: https://github.com/freeman/stash-tdarr-sync
+exec:
+  - python
+  - "{pluginDir}/tdarrSync.py"
+interface: raw
+errLog: error
+
+settings:
+  pathMap:
+    displayName: Path map
+    description: >-
+      Translate the paths Tdarr reports into the paths Stash uses. Pipe-separated pairs of
+      "from=>to", longest prefix wins. Example: /media=>/data/media|/mnt/user/tv=>/tv
+      Leave blank if Tdarr and Stash see identical paths.
+    type: STRING
+  queueDir:
+    displayName: Queue directory
+    description: >-
+      Optional. A directory readable by Stash where Tdarr drops .json event files.
+      Used by the "Drain Queue" task, and as a retry spool. Leave blank to disable.
+    type: STRING
+  disableRegenerate:
+    displayName: Skip regenerating covers/sprites/previews/phash
+    description: >-
+      Off by default, which is what you want: after a transcode the generated media still
+      describes the old file. Tick this only if you regenerate on your own schedule.
+    type: BOOLEAN
+  keepStaleFileRecord:
+    displayName: Keep the original file's database row
+    description: >-
+      By default the original file's row is removed after a successful merge, but only if
+      the file is actually gone from disk. This never deletes anything on disk. Tick to keep it.
+    type: BOOLEAN
+  scanTimeout:
+    displayName: Scan timeout (seconds)
+    description: How long to wait for a triggered scan job before giving up. Default 900.
+    type: NUMBER
+  settleTimeout:
+    displayName: File settle timeout (seconds)
+    description: >-
+      Before scanning, wait for the new file to appear and stop changing size. Guards
+      against a transcode written over SMB that Stash reads through a bind mount.
+      Default 30. Set 0 to scan immediately.
+    type: NUMBER
+  phashDistance:
+    displayName: Phash distance for reconcile
+    description: >-
+      Hamming distance used by the "Reconcile Orphans" task when matching a transcoded file
+      back to its original by perceptual hash. Default 4. Raise cautiously.
+    type: NUMBER
+  dryRun:
+    displayName: Dry run
+    description: Log every decision, change nothing. Use this the first few times.
+    type: BOOLEAN
+
+tasks:
+  - name: Test Connection
+    description: >-
+      Verify GraphQL access, print your library paths, and show how the path map resolves.
+      Run this first.
+    defaultArgs:
+      mode: test
+  - name: Sync Transcoded File
+    description: >-
+      Sync a single file. Requires originalPath and newPath args, so this is the task Tdarr
+      invokes via runPluginTask - running it from the UI with no args does nothing.
+    defaultArgs:
+      mode: sync
+  - name: Drain Queue
+    description: Process every queued event in the queue directory. Safe to run on a schedule.
+    defaultArgs:
+      mode: drain
+  - name: Reconcile Orphans
+    description: >-
+      Safety net. Finds scenes whose file has vanished from disk and re-links them to a
+      matching new scene by perceptual hash, which survives re-encoding.
+    defaultArgs:
+      mode: reconcile

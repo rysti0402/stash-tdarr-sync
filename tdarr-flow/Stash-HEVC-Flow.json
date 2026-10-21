@@ -1,0 +1,325 @@
+{
+  "_id": "stashTdarrSyncHevc",
+  "name": "HEVC + Stash Sync",
+  "description": "Re-encode to HEVC in an mkv, replace the original, then tell Stash so it can merge the new file onto the original scene and keep tags, markers, o-counter and play history. Edit the Notify Stash node before first use.",
+  "tags": "",
+  "flowPlugins": [
+    {
+      "name": "Input File",
+      "sourceRepo": "Community",
+      "pluginName": "inputFile",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "stInput01",
+      "position": {
+        "x": 420.0,
+        "y": 0.0
+      }
+    },
+    {
+      "name": "Check File Medium",
+      "sourceRepo": "Community",
+      "pluginName": "checkFileMedium",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "stMedium1",
+      "position": {
+        "x": 420.0,
+        "y": 110.0
+      }
+    },
+    {
+      "name": "Already HEVC?",
+      "sourceRepo": "Community",
+      "pluginName": "checkVideoCodec",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "stCodec01",
+      "position": {
+        "x": 420.0,
+        "y": 220.0
+      },
+      "inputsDB": {
+        "codec": "hevc"
+      }
+    },
+    {
+      "name": "Begin Command",
+      "sourceRepo": "Community",
+      "pluginName": "ffmpegCommandStart",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "stBegin01",
+      "position": {
+        "x": 420.0,
+        "y": 350.0
+      }
+    },
+    {
+      "name": "Set Video Encoder (HEVC)",
+      "sourceRepo": "Community",
+      "pluginName": "ffmpegCommandSetVideoEncoder",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "stEncode1",
+      "position": {
+        "x": 420.0,
+        "y": 460.0
+      },
+      "inputsDB": {
+        "outputCodec": "hevc",
+        "ffmpegPresetEnabled": "true",
+        "ffmpegPreset": "slow",
+        "ffmpegQualityEnabled": "true",
+        "ffmpegQuality": "24",
+        "hardwareEncoding": "true",
+        "hardwareType": "auto",
+        "hardwareDecoding": "true",
+        "forceEncoding": "false"
+      }
+    },
+    {
+      "name": "Set Container (mkv)",
+      "sourceRepo": "Community",
+      "pluginName": "ffmpegCommandSetContainer",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "stCntnr01",
+      "position": {
+        "x": 420.0,
+        "y": 570.0
+      },
+      "inputsDB": {
+        "container": "mkv",
+        "forceConform": "false"
+      }
+    },
+    {
+      "name": "Remove Data Streams",
+      "sourceRepo": "Community",
+      "pluginName": "ffmpegCommandRemoveDataStreams",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "stNoData1",
+      "position": {
+        "x": 420.0,
+        "y": 680.0
+      }
+    },
+    {
+      "name": "Execute",
+      "sourceRepo": "Community",
+      "pluginName": "ffmpegCommandExecute",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "stExec001",
+      "position": {
+        "x": 420.0,
+        "y": 790.0
+      }
+    },
+    {
+      "name": "Size Sanity Check (20-95%)",
+      "sourceRepo": "Community",
+      "pluginName": "compareFileSizeRatio",
+      "version": "2.0.0",
+      "fpEnabled": true,
+      "id": "stRatio01",
+      "position": {
+        "x": 420.0,
+        "y": 900.0
+      },
+      "inputsDB": {
+        "greaterThan": "20",
+        "lessThan": "95"
+      }
+    },
+    {
+      "name": "Replace Original File",
+      "sourceRepo": "Community",
+      "pluginName": "replaceOriginalFile",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "stReplc01",
+      "position": {
+        "x": 420.0,
+        "y": 1030.0
+      }
+    },
+    {
+      "name": "Notify Stash  <-- EDIT THE URL + API KEY IN HERE",
+      "sourceRepo": "Community",
+      "pluginName": "customFunction",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "stNotify1",
+      "position": {
+        "x": 420.0,
+        "y": 1140.0
+      },
+      "inputsDB": {
+        "code": "module.exports = async (args) => {\n  // ===================== CONFIGURE THESE =====================\n  // Reachable from the WINDOWS Tdarr node, not from your browser.\n  const STASH_URL = 'http://STASH-HOST:9999';\n  // Stash > Settings > Security > API Key\n  const STASH_API_KEY = '';\n  // Optional spool directory as this Windows node sees it, e.g. 'Z:\\\\tdarr-queue'.\n  // Leave '' to disable. If set, Stash must be able to read the same folder.\n  const QUEUE_DIR = '';\n  // ===========================================================\n\n  const PLUGIN_ID = 'tdarrSync';\n  const TASK_NAME = 'Sync Transcoded File';\n\n  const pathOf = (obj) => (obj && (obj._id || obj.file)) || '';\n  const originalPath = pathOf(args.originalLibraryFile);\n  const newPath = pathOf(args.inputFileObj);\n\n  const done = () => ({\n    outputFileObj: args.inputFileObj,\n    outputNumber: 1,\n    variables: args.variables,\n  });\n\n  if (!newPath) {\n    args.jobLog('Stash: no current file path, nothing to report');\n    return done();\n  }\n\n  if (originalPath === newPath) {\n    args.jobLog('Stash: in-place transcode of ' + newPath);\n  } else {\n    args.jobLog('Stash: ' + (originalPath || '(unknown)') + ' -> ' + newPath);\n  }\n\n  const headers = { 'Content-Type': 'application/json', Accept: 'application/json' };\n  if (STASH_API_KEY) { headers.ApiKey = STASH_API_KEY; }\n\n  const query = 'mutation($pluginId: ID!, $taskName: String!, $argsMap: Map, $description: String) {'\n    + ' runPluginTask('\n    + ' plugin_id: $pluginId'\n    + ' task_name: $taskName'\n    + ' args_map: $argsMap'\n    + ' description: $description'\n    + ' ) }';\n\n  try {\n    const res = await args.deps.axios({\n      method: 'post',\n      url: STASH_URL.replace(/\\/+$/, '') + '/graphql',\n      headers: headers,\n      timeout: 30000,\n      data: {\n        query: query,\n        variables: {\n          pluginId: PLUGIN_ID,\n          taskName: TASK_NAME,\n          description: 'Tdarr sync: ' + newPath.split(/[\\\\/]/).pop(),\n          argsMap: { mode: 'sync', originalPath: originalPath, newPath: newPath },\n        },\n      },\n    });\n\n    const errors = res.data && res.data.errors;\n    if (errors && errors.length) {\n      throw new Error(JSON.stringify(errors).slice(0, 400));\n    }\n    const jobId = res.data && res.data.data && res.data.data.runPluginTask;\n    args.jobLog('Stash queued the sync as job ' + jobId);\n  } catch (err) {\n    const message = (err && err.message) || String(err);\n    args.jobLog('Stash notification FAILED: ' + message);\n\n    if (QUEUE_DIR) {\n      try {\n        const fs = args.deps.fsextra;\n        await fs.ensureDir(QUEUE_DIR);\n        const safe = String(newPath).replace(/[^a-zA-Z0-9]+/g, '_').slice(-80);\n        const target = QUEUE_DIR.replace(/[\\\\/]+$/, '') + '/' + Date.now() + '_' + safe + '.json';\n        await fs.writeFile(target, JSON.stringify({\n          originalPath: originalPath,\n          newPath: newPath,\n          source: 'tdarr',\n          at: new Date().toISOString(),\n        }, null, 2), 'utf8');\n        args.jobLog('Stash: spooled to ' + target + ' for the Drain Queue task');\n      } catch (spoolErr) {\n        args.jobLog('Stash: could not spool either: ' + ((spoolErr && spoolErr.message) || spoolErr));\n      }\n    } else {\n      args.jobLog('Stash: no queue dir set, so run \"Reconcile Orphans\" in Stash to catch this one');\n    }\n  }\n\n  // Never fail the flow over bookkeeping - the transcode itself succeeded.\n  return done();\n};\n"
+      }
+    },
+    {
+      "name": "Fail Flow (output suspiciously small)",
+      "sourceRepo": "Community",
+      "pluginName": "failFlow",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "stFail001",
+      "position": {
+        "x": 800.0,
+        "y": 1030.0
+      }
+    },
+    {
+      "name": "SETUP: open the 'Notify Stash' node at the bottom and set STASH_URL and STASH_API_KEY. Then set the path map in Stash > Settings > Plugins > Tdarr Sync.",
+      "sourceRepo": "Community",
+      "pluginName": "comment",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "stCmt0001",
+      "position": {
+        "x": -80.0,
+        "y": -20.0
+      }
+    },
+    {
+      "name": "Output 1 means the file is already HEVC, so the flow ends and Stash is never touched. This is what stops Tdarr re-encoding its own output forever.",
+      "sourceRepo": "Community",
+      "pluginName": "comment",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "stCmt0002",
+      "position": {
+        "x": -80.0,
+        "y": 220.0
+      }
+    },
+    {
+      "name": "Band is 20-95%, not the stock 40-110%. 95 because an output LARGER than the input is a pure loss for a space-saving flow. 20 because HEVC off old DivX legitimately lands under 40% and the stock floor would throw those away.",
+      "sourceRepo": "Community",
+      "pluginName": "comment",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "stCmt0003",
+      "position": {
+        "x": -80.0,
+        "y": 880.0
+      }
+    },
+    {
+      "name": "Notify Stash MUST be last. Before 'Replace Original File' runs, args.inputFileObj._id still points at the cache copy, not the file Stash needs to scan. Branches that do not replace the original never get here, which is correct - nothing changed, so there is nothing to sync.",
+      "sourceRepo": "Community",
+      "pluginName": "comment",
+      "version": "1.0.0",
+      "fpEnabled": true,
+      "id": "stCmt0004",
+      "position": {
+        "x": -80.0,
+        "y": 1140.0
+      }
+    }
+  ],
+  "flowEdges": [
+    {
+      "source": "stInput01",
+      "sourceHandle": "1",
+      "target": "stMedium1",
+      "targetHandle": null,
+      "id": "edge00001"
+    },
+    {
+      "source": "stMedium1",
+      "sourceHandle": "1",
+      "target": "stCodec01",
+      "targetHandle": null,
+      "id": "edge00002"
+    },
+    {
+      "source": "stCodec01",
+      "sourceHandle": "2",
+      "target": "stBegin01",
+      "targetHandle": null,
+      "id": "edge00003"
+    },
+    {
+      "source": "stBegin01",
+      "sourceHandle": "1",
+      "target": "stEncode1",
+      "targetHandle": null,
+      "id": "edge00004"
+    },
+    {
+      "source": "stEncode1",
+      "sourceHandle": "1",
+      "target": "stCntnr01",
+      "targetHandle": null,
+      "id": "edge00005"
+    },
+    {
+      "source": "stCntnr01",
+      "sourceHandle": "1",
+      "target": "stNoData1",
+      "targetHandle": null,
+      "id": "edge00006"
+    },
+    {
+      "source": "stNoData1",
+      "sourceHandle": "1",
+      "target": "stExec001",
+      "targetHandle": null,
+      "id": "edge00007"
+    },
+    {
+      "source": "stExec001",
+      "sourceHandle": "1",
+      "target": "stRatio01",
+      "targetHandle": null,
+      "id": "edge00008"
+    },
+    {
+      "source": "stRatio01",
+      "sourceHandle": "1",
+      "target": "stReplc01",
+      "targetHandle": null,
+      "id": "edge00009"
+    },
+    {
+      "source": "stRatio01",
+      "sourceHandle": "2",
+      "target": "stFail001",
+      "targetHandle": null,
+      "id": "edge00010"
+    },
+    {
+      "source": "stReplc01",
+      "sourceHandle": "1",
+      "target": "stNotify1",
+      "targetHandle": null,
+      "id": "edge00011"
+    },
+    {
+      "source": "stCmt0001",
+      "sourceHandle": "1",
+      "target": "stCmt0002",
+      "targetHandle": null,
+      "id": "edge00012"
+    },
+    {
+      "source": "stCmt0002",
+      "sourceHandle": "1",
+      "target": "stCmt0003",
+      "targetHandle": null,
+      "id": "edge00013"
+    },
+    {
+      "source": "stCmt0003",
+      "sourceHandle": "1",
+      "target": "stCmt0004",
+      "targetHandle": null,
+      "id": "edge00014"
+    }
+  ]
+}
