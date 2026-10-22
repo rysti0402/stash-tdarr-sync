@@ -3,8 +3,8 @@ description: >-
   Repairs the Stash database after Tdarr transcodes a file. Rescans the new file and
   folds it back onto the original scene so tags, performers, studio, markers, o-counter,
   play history and stash-ids all survive the transcode.
-version: 0.1.0
-url: https://github.com/freeman/stash-tdarr-sync
+version: 0.2.0
+url: https://github.com/rysti0402/stash-tdarr-sync
 exec:
   - python
   - "{pluginDir}/tdarrSync.py"
@@ -37,10 +37,6 @@ settings:
       By default the original file's row is removed after a successful merge, but only if
       the file is actually gone from disk. This never deletes anything on disk. Tick to keep it.
     type: BOOLEAN
-  scanTimeout:
-    displayName: Scan timeout (seconds)
-    description: How long to wait for a triggered scan job before giving up. Default 900.
-    type: NUMBER
   settleTimeout:
     displayName: File settle timeout (seconds)
     description: >-

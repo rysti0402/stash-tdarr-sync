@@ -139,7 +139,6 @@ are missing matches, and re-check the dry-run output when you do.
 | Queue directory | empty | Spool dir, must be readable by Stash |
 | Skip regenerating | off | Leave off. Covers, sprites, previews and phash all describe the old file after a transcode. |
 | Keep the original file's database row | off | When off, the stale row is deleted **only if the file is genuinely gone from disk**. Nothing on disk is ever touched. |
-| Scan timeout | 900 | Seconds to wait for the scan job |
 | File settle timeout | 30 | Waits for the new file to appear and stop growing before scanning. Matters when Tdarr writes over SMB and Stash reads a bind mount. 0 disables. |
 | Phash distance | 4 | Reconcile only |
 | Dry run | off | Logs decisions, writes nothing |

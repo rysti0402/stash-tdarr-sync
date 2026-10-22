@@ -10,6 +10,12 @@ play history.
 This plugin closes that gap. Given the before and after paths it rescans the new file
 and folds it onto the original scene, keeping the original scene id.
 
+Stash runs queued jobs strictly one at a time, and this plugin is itself one of those
+jobs. So it must never wait on a scan it queued - the scan cannot start until the plugin
+exits. Instead a sync happens in two phases: phase one queues the scan and then queues a
+"finish" run of this same plugin behind it, and exits. The queue order guarantees the
+scan has completed by the time the finish phase runs.
+
 Standard library only - nothing to pip install.
 """
 
@@ -122,25 +128,24 @@ DEFAULTS = {
     "queueDir": "",
     "disableRegenerate": False,
     "keepStaleFileRecord": False,
-    "scanTimeout": 900,
     "settleTimeout": 30,
     "phashDistance": 4,
     "dryRun": False,
 }
 
 
-def load_settings(client):
+def load_settings(client, plugin_id):
     settings = dict(DEFAULTS)
     try:
         plugins = client.call("query { configuration { plugins } }")
         stored = (plugins.get("configuration") or {}).get("plugins") or {}
-        for key, value in (stored.get(PLUGIN_ID) or {}).items():
+        for key, value in (stored.get(plugin_id) or {}).items():
             if value not in (None, ""):
                 settings[key] = value
     except StashError as exc:
         warn("Could not read plugin settings, falling back to defaults: {}".format(exc))
 
-    for numeric in ("scanTimeout", "settleTimeout", "phashDistance"):
+    for numeric in ("settleTimeout", "phashDistance"):
         try:
             settings[numeric] = int(settings[numeric])
         except (TypeError, ValueError):
@@ -288,40 +293,8 @@ def find_by_path(client, path):
     return _match_exact(data["findScenes"]["scenes"], path)
 
 
-def wait_for_job(client, job_id, timeout, label):
-    query = "query($id: ID!) { findJob(input: {id: $id}) { id status progress error } }"
-    deadline = time.time() + timeout
-    last_status = None
-
-    while time.time() < deadline:
-        job = client.call(query, {"id": job_id}).get("findJob")
-        if job is None:
-            # The job has already been evicted from the queue, so it is done.
-            debug("{} job {} no longer in the queue, treating as finished".format(label, job_id))
-            return True
-
-        status = job["status"]
-        if status != last_status:
-            debug("{} job {}: {}".format(label, job_id, status))
-            last_status = status
-        if status == "FINISHED":
-            return True
-        if status in ("CANCELLED", "FAILED"):
-            error(
-                "{} job {} ended as {}: {}".format(
-                    label, job_id, status, job.get("error") or "no detail given"
-                )
-            )
-            return False
-        if job.get("progress") is not None:
-            progress(job["progress"])
-        time.sleep(1.0)
-
-    error("Timed out after {}s waiting for the {} job ({})".format(timeout, label, job_id))
-    return False
-
-
-def scan_paths(client, paths, timeout):
+def queue_scan(client, paths):
+    """Queue a scan. Never wait for it - see the module docstring."""
     job_id = client.call(
         "mutation($input: ScanMetadataInput!) { metadataScan(input: $input) }",
         {
@@ -334,8 +307,24 @@ def scan_paths(client, paths, timeout):
             }
         },
     )["metadataScan"]
-    info("Scanning {} (job {})".format(", ".join(paths), job_id))
-    return wait_for_job(client, job_id, timeout, "scan")
+    info("Queued scan of {} (job {})".format(", ".join(paths), job_id))
+    return job_id
+
+
+def queue_self(ctx, args_map, description):
+    """Queue another run of this plugin behind whatever is already queued.
+
+    No task_name, so the args below are used verbatim rather than merged with a task's
+    defaultArgs. Every value is a string because that is the one shape guaranteed to
+    survive the trip through runPluginTask's args_map.
+    """
+    job_id = ctx.client.call(
+        "mutation($id: ID!, $args: Map, $description: String) {"
+        " runPluginTask(plugin_id: $id, args_map: $args, description: $description) }",
+        {"id": ctx.plugin_id, "args": args_map, "description": description},
+    )["runPluginTask"]
+    info("Queued finish step (job {}); it runs after the scan".format(job_id))
+    return job_id
 
 
 def regenerate(client, scene_ids):
@@ -393,12 +382,12 @@ def delete_file_records(client, file_ids):
 
 
 class Context:
-    def __init__(self, client, settings):
+    def __init__(self, client, settings, plugin_id):
         self.client = client
         self.settings = settings
+        self.plugin_id = plugin_id
         self.path_pairs = parse_path_map(settings["pathMap"])
         self.dry_run = bool(settings["dryRun"])
-        self.timeout = settings["scanTimeout"]
         self.touched_scene_ids = []
 
     def mapped(self, path):
@@ -408,13 +397,12 @@ class Context:
         return translated
 
 
-def sync_one(ctx, original_path, new_path):
-    """Reconcile one transcode. Returns True on success."""
-    client = ctx.client
+def prepare_event(ctx, original_path, new_path):
+    """Phase one for a single transcode: resolve paths and record the original scene.
 
-    if not new_path:
-        error("No newPath supplied; nothing to sync")
-        return False
+    Returns an event dict for the finish phase. Nothing is written to Stash here.
+    """
+    client = ctx.client
 
     original_path = ctx.mapped(original_path or "")
     new_path = ctx.mapped(new_path)
@@ -429,12 +417,26 @@ def sync_one(ctx, original_path, new_path):
         )
 
     in_place = bool(original_path) and norm(original_path) == norm(new_path)
+    event = {
+        "originalPath": original_path,
+        "newPath": new_path,
+        "inPlace": in_place,
+        "oldSceneId": "",
+        "oldFileId": "",
+        "oldFilePath": "",
+        "oldDuration": "",
+    }
 
-    old_scene = old_file = None
     if original_path and not in_place:
         found = find_by_path(client, original_path)
         if found:
             old_scene, old_file = found
+            event.update(
+                oldSceneId=old_scene["id"],
+                oldFileId=old_file["id"],
+                oldFilePath=old_file["path"],
+                oldDuration=str(old_file.get("duration") or ""),
+            )
             info(
                 'Original is scene {} "{}"'.format(
                     old_scene["id"], old_scene.get("title") or "(untitled)"
@@ -443,80 +445,79 @@ def sync_one(ctx, original_path, new_path):
         else:
             info("No existing scene owns {}; this will just be a new file".format(original_path))
 
-    if ctx.dry_run:
-        if old_scene:
-            info("DRY RUN: would scan {} and merge it onto scene {}".format(new_path, old_scene["id"]))
-        else:
-            info("DRY RUN: would scan {}; no original scene to merge onto".format(new_path))
+    return event
+
+
+def schedule(ctx, events, attempt=1, scan_paths=None):
+    """Queue one scan for every event, then queue the finish phase behind it."""
+    if not events:
         return True
 
-    # Scan the new file. Fall back to its folder if the direct path yields nothing,
-    # which happens when the scanner needs a directory root.
-    if not scan_paths(client, [new_path], ctx.timeout):
-        return False
+    if ctx.dry_run:
+        for event in events:
+            if event["oldSceneId"]:
+                info("DRY RUN: would scan {} and merge it onto scene {}".format(
+                    event["newPath"], event["oldSceneId"]))
+            else:
+                info("DRY RUN: would scan {}; no original scene to merge onto".format(
+                    event["newPath"]))
+        return True
 
-    found = find_by_path(client, new_path)
-    if not found:
-        parent = os.path.dirname(new_path.replace("\\", "/"))
-        info("Not found after scanning the file directly; retrying with {}".format(parent))
-        if parent and scan_paths(client, [parent], ctx.timeout):
-            found = find_by_path(client, new_path)
+    paths = scan_paths or sorted({event["newPath"] for event in events})
+    queue_scan(ctx.client, paths)
+    queue_self(
+        ctx,
+        {"mode": "finish", "events": json.dumps(events), "attempt": str(attempt)},
+        "Tdarr Sync: finish {} file(s)".format(len(events)),
+    )
+    return True
 
-    if not found:
-        error(
-            "{} is not in Stash after a scan. It is almost certainly outside your "
-            "configured library paths, or the path map is wrong.".format(new_path)
-        )
-        return False
 
+def complete_event(ctx, event, found):
+    """Phase two for a single transcode: the scan has run, now fold it in."""
+    client = ctx.client
     new_scene, new_file = found
 
-    if in_place:
+    if event.get("inPlace"):
         info("In-place transcode; scene {} refreshed from disk".format(new_scene["id"]))
         ctx.touched_scene_ids.append(new_scene["id"])
         return True
 
-    if old_scene is None:
-        info("Scanned {} as new scene {}".format(new_path, new_scene["id"]))
+    old_scene_id = event.get("oldSceneId")
+    if not old_scene_id:
+        info("Scanned {} as new scene {}".format(event["newPath"], new_scene["id"]))
         ctx.touched_scene_ids.append(new_scene["id"])
         return True
 
-    if old_scene["id"] == new_scene["id"]:
-        info("Stash already attached the new file to scene {}".format(old_scene["id"]))
+    if old_scene_id == new_scene["id"]:
+        info("Stash already attached the new file to scene {}".format(old_scene_id))
     else:
-        info(
-            "Merging new scene {} into original scene {}".format(
-                new_scene["id"], old_scene["id"]
-            )
-        )
-        merge_scenes(client, old_scene["id"], [new_scene["id"]])
+        info("Merging new scene {} into original scene {}".format(new_scene["id"], old_scene_id))
+        merge_scenes(client, old_scene_id, [new_scene["id"]])
 
-    set_primary_file(client, old_scene["id"], new_file["id"])
-    info("Scene {} now points at {}".format(old_scene["id"], new_file["path"]))
+    set_primary_file(client, old_scene_id, new_file["id"])
+    info("Scene {} now points at {}".format(old_scene_id, new_file["path"]))
 
-    _warn_on_duration_drift(old_file, new_file)
+    _warn_on_duration_drift(event.get("oldDuration"), new_file.get("duration"))
 
-    if old_file and not ctx.settings["keepStaleFileRecord"]:
-        if os.path.exists(old_file["path"]):
-            info(
-                "Keeping the old file row; {} still exists on disk".format(old_file["path"])
-            )
+    old_file_id, old_file_path = event.get("oldFileId"), event.get("oldFilePath")
+    if old_file_id and not ctx.settings["keepStaleFileRecord"]:
+        if os.path.exists(old_file_path):
+            info("Keeping the old file row; {} still exists on disk".format(old_file_path))
         else:
-            delete_file_records(client, [old_file["id"]])
-            info("Removed the stale database row for {}".format(old_file["path"]))
+            delete_file_records(client, [old_file_id])
+            info("Removed the stale database row for {}".format(old_file_path))
 
-    ctx.touched_scene_ids.append(old_scene["id"])
+    ctx.touched_scene_ids.append(old_scene_id)
     return True
 
 
-def _warn_on_duration_drift(old_file, new_file):
-    if not old_file:
+def _warn_on_duration_drift(old_duration, new_duration):
+    try:
+        old_duration, new_duration = float(old_duration), float(new_duration)
+    except (TypeError, ValueError):
         return
-    old_duration = old_file.get("duration")
-    new_duration = new_file.get("duration")
-    if not old_duration or not new_duration:
-        return
-    drift = abs(float(old_duration) - float(new_duration))
+    drift = abs(old_duration - new_duration)
     if drift > 1.0:
         warn(
             "Duration changed by {:.1f}s ({:.1f} -> {:.1f}). Scene markers on this scene "
@@ -538,9 +539,47 @@ def mode_sync(ctx, args):
             "It is meant to be invoked by Tdarr, not run from the Tasks screen."
         )
         return False
-    ok = sync_one(ctx, original_path, new_path)
+    return schedule(ctx, [prepare_event(ctx, original_path, new_path)])
+
+
+def mode_finish(ctx, args):
+    raw = args.get("events") or "[]"
+    events = json.loads(raw) if isinstance(raw, str) else raw
+    try:
+        attempt = int(args.get("attempt") or 1)
+    except (TypeError, ValueError):
+        attempt = 1
+
+    missing, failures = [], 0
+    for event in events:
+        try:
+            found = find_by_path(ctx.client, event["newPath"])
+            if not found:
+                missing.append(event)
+                continue
+            ok = complete_event(ctx, event, found)
+        except StashError as exc:
+            error("Finishing {} failed: {}".format(event.get("newPath"), exc))
+            ok = False
+        _settle_queue_file(event, ok, "finish step failed")
+        failures += 0 if ok else 1
+
+    if missing and attempt < 2:
+        # Some scanners only pick a file up when given its folder as the root.
+        folders = sorted({os.path.dirname(e["newPath"].replace("\\", "/")) for e in missing})
+        info("{} file(s) not in Stash yet; rescanning their folders".format(len(missing)))
+        schedule(ctx, missing, attempt=attempt + 1, scan_paths=folders)
+    else:
+        for event in missing:
+            error(
+                "{} is not in Stash after a scan. It is almost certainly outside your "
+                "configured library paths, or the path map is wrong.".format(event["newPath"])
+            )
+            _settle_queue_file(event, False, "not found in Stash after scan")
+            failures += 1
+
     _finish_regeneration(ctx)
-    return ok
+    return failures == 0
 
 
 def mode_drain(ctx, args):
@@ -552,47 +591,53 @@ def mode_drain(ctx, args):
         error("Queue directory does not exist or is not readable: {}".format(queue_dir))
         return False
 
-    events = sorted(
+    names = sorted(
         (entry for entry in os.listdir(queue_dir) if entry.lower().endswith(".json")),
         key=lambda name: os.path.getmtime(os.path.join(queue_dir, name)),
     )
-    if not events:
+    if not names:
         info("Queue is empty")
         return True
 
-    info("Draining {} queued event(s) from {}".format(len(events), queue_dir))
-    failures = 0
-    for index, name in enumerate(events):
-        progress(index / float(len(events)))
+    info("Draining {} queued event(s) from {}".format(len(names), queue_dir))
+    events, failures = [], 0
+    for name in names:
         full_path = os.path.join(queue_dir, name)
         try:
             with open(full_path, "r", encoding="utf-8") as handle:
-                event = json.load(handle)
-        except (OSError, ValueError) as exc:
-            error("Skipping unreadable event {}: {}".format(name, exc))
+                raw = json.load(handle)
+            event = prepare_event(ctx, raw.get("originalPath", ""), raw.get("newPath", ""))
+        except (OSError, ValueError, StashError) as exc:
+            error("Skipping event {}: {}".format(name, exc))
             _mark_failed(full_path, str(exc))
             failures += 1
             continue
 
-        try:
-            ok = sync_one(ctx, event.get("originalPath", ""), event.get("newPath", ""))
-        except StashError as exc:
-            error("Event {} failed: {}".format(name, exc))
-            ok = False
+        if not ctx.dry_run:
+            # Park it as in-flight so the next drain does not pick it up again; the
+            # finish phase deletes it on success or marks it failed.
+            inflight = full_path + ".inflight"
+            os.replace(full_path, inflight)
+            event["queueFile"] = inflight
+        events.append(event)
 
-        if ok and not ctx.dry_run:
-            try:
-                os.remove(full_path)
-            except OSError as exc:
-                warn("Processed {} but could not remove it: {}".format(name, exc))
-        elif not ok:
-            _mark_failed(full_path, "sync returned failure")
-            failures += 1
-
-    _finish_regeneration(ctx)
-    progress(1.0)
-    info("Drain complete: {} ok, {} failed".format(len(events) - failures, failures))
+    schedule(ctx, events)
     return failures == 0
+
+
+def _settle_queue_file(event, ok, reason):
+    queue_file = event.get("queueFile")
+    if not queue_file:
+        return
+    try:
+        if ok:
+            os.remove(queue_file)
+        else:
+            original = queue_file[: -len(".inflight")]
+            os.replace(queue_file, original)
+            _mark_failed(original, reason)
+    except OSError as exc:
+        warn("Could not tidy queue file {}: {}".format(queue_file, exc))
 
 
 def _mark_failed(full_path, reason):
@@ -726,6 +771,7 @@ def _finish_regeneration(ctx):
 
 MODES = {
     "sync": mode_sync,
+    "finish": mode_finish,
     "drain": mode_drain,
     "reconcile": mode_reconcile,
     "test": mode_test,
@@ -758,10 +804,14 @@ def main():
         json.dump({"error": "unknown mode"}, sys.stdout)
         return 1
 
+    # The plugin id is the plugin's directory name; fall back if Stash does not say.
+    plugin_dir = connection.get("PluginDir") or ""
+    plugin_id = os.path.basename(os.path.normpath(plugin_dir)) if plugin_dir else PLUGIN_ID
+
     try:
         client = StashClient(connection)
-        settings = load_settings(client)
-        ctx = Context(client, settings)
+        settings = load_settings(client, plugin_id)
+        ctx = Context(client, settings, plugin_id)
         if ctx.dry_run:
             warn("DRY RUN is enabled - no changes will be written")
         ok = MODES[mode](ctx, args)
